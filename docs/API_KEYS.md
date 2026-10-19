@@ -395,3 +395,265 @@ Indexes: `keyHash` (unique, used for O(1) auth lookup), `createdById`, `createdA
 | `tests/unit/api-key-crypto.test.ts` | Unit tests for crypto utilities |
 | `tests/api/api-keys.test.ts` | API handler tests for management routes |
 | `tests/api/export.test.ts` | Updated — covers API key auth path on export routes |
+
+
+---
+
+## API Key Rotation Procedures (Operator Guide)
+
+### Overview
+
+API key rotation is a critical security procedure that should be performed:
+- **Regularly** — every 90 days as part of standard security hygiene
+- **On compromise** — immediately if a key is suspected to be leaked
+- **On personnel changes** — when operators with key access leave the team
+- **After security incidents** — as part of incident response procedures
+
+### Pre-Rotation Checklist
+
+Before rotating keys:
+
+1. **Inventory all active keys:**
+   ```bash
+   curl -H "Cookie: next-auth.session-token=<session>" \
+     https://your-deployment/api/settings/api-keys
+   ```
+
+2. **Identify key consumers:**
+   - CI/CD pipelines (GitHub Actions, GitLab CI, etc.)
+   - Cron jobs and schedulers
+   - External monitoring/audit systems
+   - Third-party integrations
+
+3. **Check recent usage:**
+   - Review `lastUsedAt` timestamps for each key
+   - Verify `actorLogin` patterns in audit logs (`/api/audit`)
+   - Confirm no keys are unexpectedly idle (might indicate broken integration)
+
+4. **Prepare rollback plan:**
+   - Document current key IDs and names
+   - Ensure you can quickly revoke new keys if rotation causes issues
+   - Have maintainer session access ready for emergency manual intervention
+
+### Rotation Procedure (Zero-Downtime)
+
+#### Step 1: Create new keys
+
+```bash
+# Create replacement key
+curl -X POST https://your-deployment/api/settings/api-keys \
+  -H "Content-Type: application/json" \
+  -H "Cookie: next-auth.session-token=<session>" \
+  -d '{
+    "name": "nightly-export-cron-2027-Q1",
+    "scopes": ["export:read"],
+    "expiresAt": "2027-04-01T00:00:00Z"
+  }'
+```
+
+**CRITICAL:** Copy the `secret` field from the response immediately. It will NOT be shown again.
+
+#### Step 2: Update consumers (parallel deployment)
+
+Do NOT revoke old keys yet. Update consumers to use the new key while old keys remain active:
+
+**GitHub Actions:**
+1. Go to repository Settings → Secrets and variables → Actions
+2. Create new secret: `TRUSTBRIDGE_API_KEY_NEW`
+3. Update workflow to try new key first, fall back to old:
+   ```yaml
+   - name: Export with new key (graceful fallback)
+     run: |
+       curl -f -H "Authorization: Bearer ${{ secrets.TRUSTBRIDGE_API_KEY_NEW }}" \
+         "$TRUSTBRIDGE_URL/api/contributors/export/csv" -o contributors.csv || \
+       curl -f -H "Authorization: Bearer ${{ secrets.TRUSTBRIDGE_API_KEY }}" \
+         "$TRUSTBRIDGE_URL/api/contributors/export/csv" -o contributors.csv
+   ```
+
+**Cron jobs:**
+```bash
+# Update secret manager / environment
+export TRUSTBRIDGE_API_KEY_NEW="tb_newkey..."
+
+# Update script to try new key first
+curl -H "Authorization: Bearer $TRUSTBRIDGE_API_KEY_NEW" ... || \
+  curl -H "Authorization: Bearer $TRUSTBRIDGE_API_KEY" ...
+```
+
+#### Step 3: Verify new keys work
+
+Monitor for 24-48 hours:
+
+```bash
+# Check new key usage in audit log
+curl -H "Cookie: ..." https://your-deployment/api/audit \
+  | jq '.entries[] | select(.actorLogin | startswith("api-key:nightly-export-cron-2027-Q1"))'
+
+# Verify no new key rejections
+curl -H "Cookie: ..." https://your-deployment/api/audit \
+  | jq '.entries[] | select(.action == "api_key.use_rejected")'
+```
+
+#### Step 4: Revoke old keys
+
+Once new keys are confirmed working:
+
+```bash
+# Revoke old key
+curl -X DELETE https://your-deployment/api/settings/api-keys/<old-key-id> \
+  -H "Cookie: next-auth.session-token=<session>"
+```
+
+**Audit verification:**
+- Check audit log for `api_key.revoked` entry
+- Confirm old key ID appears in revocation audit
+- Monitor for any `api_key.use_rejected` with reason: "revoked" (indicates a consumer wasn't updated)
+
+#### Step 5: Clean up fallback logic
+
+After old keys are fully decommissioned (7-14 days):
+
+1. Remove old secrets from secret stores
+2. Remove fallback logic from scripts/workflows
+3. Delete `TRUSTBRIDGE_API_KEY` (old) environment variables
+4. Rename `TRUSTBRIDGE_API_KEY_NEW` → `TRUSTBRIDGE_API_KEY`
+
+### Emergency Rotation (Immediate Revocation)
+
+If a key is compromised:
+
+#### Immediate actions (within 5 minutes):
+
+```bash
+# 1. Revoke compromised key immediately
+curl -X DELETE https://your-deployment/api/settings/api-keys/<compromised-id> \
+  -H "Cookie: <session>"
+
+# 2. Create replacement key
+curl -X POST https://your-deployment/api/settings/api-keys \
+  -H "Content-Type: application/json" -H "Cookie: <session>" \
+  -d '{"name":"emergency-replacement-<timestamp>","scopes":["export:read"]}'
+
+# 3. Update critical consumers NOW (cron jobs, CI)
+# 4. Check audit log for unauthorized use of compromised key
+curl -H "Cookie: <session>" https://your-deployment/api/audit \
+  | jq '.entries[] | select(.actorLogin == "api-key:<compromised-name>")'
+```
+
+#### Post-incident review (within 24 hours):
+
+- Audit all API key usage in the exposure window
+- Review export logs for data exfiltration indicators
+- Rotate adjacent secrets (database passwords, other API keys)
+- Document timeline and exposure scope for incident report
+- Update runbooks and key management procedures
+
+### Test Vector Validation
+
+Operators can verify crypto implementation integrity using fixed test vectors:
+
+```bash
+# Run test vector validation
+npm test -- tests/unit/api-key-crypto.test.ts -t "API key rotation test vectors"
+```
+
+**Test vectors** (documented in `tests/unit/api-key-crypto.test.ts`):
+
+| Raw Key | Expected SHA-256 Hash |
+|---------|----------------------|
+| `tb_RotationTestVector123456789ABCDEFGH` | `2f5a15ea8beadbea32ce0332407f78c9184467aff5654b5e3147e036cbb491a9` |
+| `tb_1234567` | `85ccc58191840b1640d85e4e052de1376959c2edddd2d7b0c7fb3a65656e7520` |
+| `tb_A-Z_0-9_test-key-with-dashes_underscores` | `ccd197f3b2ebb7b8d528ec3f7c66a4c6f3c5f30249dee2fb17f789537b94bfb6` |
+
+If test vectors fail after a Node.js or crypto library upgrade, **STOP** — this indicates a breaking change that will invalidate all existing keys.
+
+### Troubleshooting
+
+#### "Key not found" after rotation
+- **Cause:** Hash mismatch between stored and computed hash
+- **Fix:** Verify no whitespace/encoding issues when copying key
+- **Verify:** Run `hashApiKey()` on the raw key and compare to DB `keyHash`
+
+#### "Insufficient scope" errors
+- **Cause:** New key missing required scopes
+- **Fix:** Revoke and recreate key with correct scopes array
+
+#### Consumer still using old key after revocation
+- **Symptoms:** `api_key.use_rejected` with reason: "revoked"
+- **Fix:** Check consumer's secret store, ensure update was deployed
+- **Monitor:** `actorLogin` field in audit log shows which key is being used
+
+#### Rate limiting during rotation testing
+- **Cause:** Parallel key testing hitting IP rate limit (60/minute)
+- **Fix:** Stagger tests or temporarily increase `API_KEY_RATE_LIMIT` env var
+- **Note:** Rate limit is per-instance; multi-instance deployments have N× effective limit
+
+### Audit Trail
+
+Every rotation step generates audit log entries:
+
+| Action | Audit Entry | Notes |
+|--------|-------------|-------|
+| Create new key | `api_key.created` | `metadata.scopes` lists granted permissions |
+| First use of new key | Normal usage (no special entry) | `actorLogin` = `api-key:<new-name>` |
+| Revoke old key | `api_key.revoked` | `targetLabel` = old key name |
+| Attempt to use revoked key | `api_key.use_rejected` | `metadata.reason` = "revoked" |
+
+Query audit log for rotation verification:
+
+```bash
+# All key lifecycle events in last 7 days
+curl -H "Cookie: <session>" "https://your-deployment/api/audit?limit=200" \
+  | jq '.entries[] | select(.action | startswith("api_key"))'
+```
+
+### Security Best Practices
+
+1. **Never log raw keys** — only log key IDs or names
+2. **Use expiry dates** — set `expiresAt` for non-permanent keys
+3. **Scope minimization** — grant only required scopes (e.g., `export:read` not `*`)
+4. **Monitor lastUsedAt** — unused keys should be revoked
+5. **Audit review** — weekly review of `api_key.use_rejected` entries
+6. **Separate keys per consumer** — don't share one key across multiple systems
+7. **Document key purpose** — use descriptive names like `github-actions-wave-export`
+
+### Automation
+
+For teams with >10 keys, consider automating rotation:
+
+```bash
+#!/bin/bash
+# rotate-trustbridge-keys.sh
+# Run quarterly as cron job
+
+set -euo pipefail
+
+KEYS=$(curl -s -H "Cookie: $SESSION_COOKIE" "$TRUSTBRIDGE_URL/api/settings/api-keys" | jq -r '.keys[].id')
+
+for key_id in $KEYS; do
+  # Get key details
+  key_info=$(curl -s -H "Cookie: $SESSION_COOKIE" "$TRUSTBRIDGE_URL/api/settings/api-keys" \
+    | jq -r ".keys[] | select(.id == \"$key_id\")")
+
+  # Check if key is >90 days old
+  created_at=$(echo "$key_info" | jq -r '.createdAt')
+  age_days=$(( ( $(date +%s) - $(date -d "$created_at" +%s) ) / 86400 ))
+
+  if [ $age_days -gt 90 ]; then
+    echo "Rotating key: $(echo "$key_info" | jq -r '.name') (age: $age_days days)"
+    # TODO: Implement create-new, update-consumer, revoke-old logic
+  fi
+done
+```
+
+**Important:** Test automation thoroughly in staging before production deployment.
+
+---
+
+## References
+
+- Crypto implementation: `src/lib/api-key-crypto.ts`
+- Test vectors: `tests/unit/api-key-crypto.test.ts`
+- Key management UI: `src/components/ApiKeyPanel.tsx`
+- Audit logging: `src/lib/audit.ts`
+- Rate limiting: `src/lib/rate-limit.ts`

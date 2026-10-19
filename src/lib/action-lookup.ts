@@ -9,6 +9,106 @@ export type WizardAction =
   | "increase_reserve"
   | "none";
 
+/**
+ * Action version metadata cache configuration.
+ * Caches action lookup results to reduce repeated Horizon queries.
+ */
+export interface ActionCacheConfig {
+  /** TTL in milliseconds for cached action metadata */
+  ttlMs: number;
+  /** Maximum cache size (number of entries) */
+  maxSize: number;
+}
+
+export const DEFAULT_ACTION_CACHE_CONFIG: ActionCacheConfig = {
+  ttlMs: 5 * 60 * 1000, // 5 minutes
+  maxSize: 1000,
+};
+
+interface CachedActionEntry {
+  result: ActionLookupResult;
+  timestamp: number;
+  pin?: string; // Optional version pin for cache invalidation
+}
+
+const actionCache = new Map<string, CachedActionEntry>();
+
+/**
+ * Get cached action lookup result if valid (within TTL and pin matches).
+ * Returns null if cache miss or expired.
+ */
+export function getCachedAction(
+  address: string,
+  pin?: string,
+  config: ActionCacheConfig = DEFAULT_ACTION_CACHE_CONFIG
+): ActionLookupResult | null {
+  const entry = actionCache.get(address);
+  if (!entry) return null;
+
+  const now = Date.now();
+  const isExpired = now - entry.timestamp > config.ttlMs;
+  const isPinMismatch = pin !== undefined && entry.pin !== pin;
+
+  if (isExpired || isPinMismatch) {
+    actionCache.delete(address);
+    return null;
+  }
+
+  return entry.result;
+}
+
+/**
+ * Cache an action lookup result with optional version pin.
+ */
+export function cacheAction(
+  address: string,
+  result: ActionLookupResult,
+  pin?: string,
+  config: ActionCacheConfig = DEFAULT_ACTION_CACHE_CONFIG
+): void {
+  // Enforce max cache size using simple LRU (delete oldest)
+  if (actionCache.size >= config.maxSize) {
+    const firstKey = actionCache.keys().next().value;
+    if (firstKey) actionCache.delete(firstKey);
+  }
+
+  actionCache.set(address, {
+    result,
+    timestamp: Date.now(),
+    pin,
+  });
+}
+
+/**
+ * Invalidate cached action for a specific address.
+ */
+export function invalidateActionCache(address: string): void {
+  actionCache.delete(address);
+}
+
+/**
+ * Invalidate all cached actions where pin matches (or all if no pin specified).
+ */
+export function invalidateActionCacheByPin(pin?: string): void {
+  if (pin === undefined) {
+    actionCache.clear();
+    return;
+  }
+
+  for (const [address, entry] of actionCache.entries()) {
+    if (entry.pin === pin) {
+      actionCache.delete(address);
+    }
+  }
+}
+
+/**
+ * Clear entire action cache.
+ */
+export function clearActionCache(): void {
+  actionCache.clear();
+}
+
 export interface ActionLookupResult extends HorizonCheckResult {
   nextAction: WizardAction;
 }

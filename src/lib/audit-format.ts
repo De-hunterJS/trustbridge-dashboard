@@ -1,5 +1,101 @@
 import type { AuditLogEntry } from "@/types";
 
+/**
+ * List of metadata keys that should always be masked in audit views.
+ * Extend this list when new secret-containing fields are added to audit metadata.
+ */
+const SECRET_METADATA_KEYS = [
+  "rawKey",
+  "secret",
+  "token",
+  "apiKey",
+  "password",
+  "privateKey",
+  "accessToken",
+  "refreshToken",
+  "keyHash", // While hashed, still sensitive
+] as const;
+
+/**
+ * Redact sensitive values from audit metadata.
+ * Returns a new object with secret fields masked.
+ */
+export function redactAuditMetadata(
+  metadata: Record<string, unknown> | null | undefined
+): Record<string, unknown> | null {
+  if (!metadata || typeof metadata !== "object") return null;
+
+  const redacted: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(metadata)) {
+    const lowerKey = key.toLowerCase();
+    const isSecret = SECRET_METADATA_KEYS.some((secretKey) =>
+      lowerKey.includes(secretKey.toLowerCase())
+    );
+
+    if (isSecret) {
+      redacted[key] = "[REDACTED]";
+    } else if (value && typeof value === "object" && !Array.isArray(value)) {
+      // Recursively redact nested objects
+      redacted[key] = redactAuditMetadata(value as Record<string, unknown>);
+    } else {
+      redacted[key] = value;
+    }
+  }
+
+  return redacted;
+}
+
+/**
+ * Normalize actor fields for consistent display in audit views.
+ * Handles system actions (no actor), API key actions, and user actions.
+ */
+export function normalizeAuditActor(entry: AuditLogEntry): {
+  actorType: "system" | "api_key" | "user";
+  displayName: string;
+  actorId: string | null;
+} {
+  // System action (no actor)
+  if (!entry.actorId && !entry.actorLogin) {
+    return {
+      actorType: "system",
+      displayName: "System",
+      actorId: null,
+    };
+  }
+
+  // API key action (actorLogin format: "api-key:<name>")
+  if (entry.actorLogin?.startsWith("api-key:")) {
+    const keyName = entry.actorLogin.slice(8); // strip "api-key:" prefix
+    return {
+      actorType: "api_key",
+      displayName: `API Key: ${keyName}`,
+      actorId: entry.actorId,
+    };
+  }
+
+  // User action
+  return {
+    actorType: "user",
+    displayName: entry.actorLogin ?? entry.actorId ?? "Unknown",
+    actorId: entry.actorId,
+  };
+}
+
+/**
+ * Prepare an audit log entry for display in admin views.
+ * Redacts secrets and normalizes actor fields.
+ */
+export function formatAuditEntryForAdmin(
+  entry: AuditLogEntry
+): AuditLogEntry & { actor: ReturnType<typeof normalizeAuditActor> } {
+  return {
+    ...entry,
+    metadata: redactAuditMetadata(entry.metadata),
+    actor: normalizeAuditActor(entry),
+  };
+}
+
 /** Human-readable labels for known audit actions. */
 export const AUDIT_ACTION_LABELS: Record<string, string> = {
   "recheck.single": "Re-checked a contributor",

@@ -4,6 +4,8 @@ import {
   getContributorsCsvFilename,
   getCachedCsv,
   invalidateCsvCache,
+  CSV_COLUMN_ORDER,
+  validateCsvColumnOrder,
 } from "./csv-export";
 import type { ContributorRow } from "@/types";
 
@@ -117,5 +119,106 @@ describe("csv-export", () => {
 
     expect(csv).toContain("Required USDC trustline is missing.");
     expect(csv).toContain("TrustBridge Freighter ownership proof");
+  });
+});
+
+describe("CSV column order stability (golden tests)", () => {
+  const mockContributor: ContributorRow = {
+    id: "1",
+    githubUsername: "alice",
+    stellarAddress: "GA1234567890ABCDEF",
+    funded: true,
+    trustlineReady: true,
+    trustlineAuthorized: true,
+    verified: true,
+    xlmBalance: "100.5",
+    spendableXlmBalance: "99.5",
+    readiness: "ready",
+    lastCheckedAt: "2026-07-25T10:00:00Z",
+  };
+
+  it("exports columns in exact order defined by CSV_COLUMN_ORDER", () => {
+    const csv = buildContributorsCsv([mockContributor]);
+    const lines = csv.split("\n");
+    const headerLine = lines[0];
+
+    const expectedHeader = CSV_COLUMN_ORDER.map((col) => `"${col}"`).join(",");
+
+    expect(headerLine).toBe(expectedHeader);
+  });
+
+  it("golden test: CSV header must match exact column order", () => {
+    const csv = buildContributorsCsv([mockContributor]);
+    const lines = csv.split("\n");
+
+    // Golden assertion — this snapshot must NOT change across releases
+    // Changing column order breaks finance reconciliation scripts
+    expect(lines[0]).toBe(
+      '"id","githubUsername","stellarAddress","funded","trustlineReady",' +
+        '"trustlineAuthorized","verified","xlmBalance","spendableXlmBalance",' +
+        '"readiness","lastCheckedAt","horizonDebugSummary","horizonNextAction",' +
+        '"freighterProofChallenge"'
+    );
+  });
+
+  it("validates actual CSV output matches declared column order", () => {
+    const csv = buildContributorsCsv([mockContributor]);
+
+    expect(() => validateCsvColumnOrder(csv)).not.toThrow();
+  });
+
+  it("detects column order violations", () => {
+    // Simulate a CSV with columns in wrong order
+    const wrongOrderCsv =
+      '"githubUsername","id","stellarAddress"\n' +
+      '"alice","1","GA1234567890ABCDEF"';
+
+    expect(() => validateCsvColumnOrder(wrongOrderCsv)).toThrow(
+      /Column order mismatch/
+    );
+  });
+
+  it("ensures column count stays constant", () => {
+    const csv = buildContributorsCsv([mockContributor]);
+    const lines = csv.split("\n");
+    const headerColumns = lines[0].split(",");
+
+    // Golden assertion — column count must remain 14
+    expect(headerColumns).toHaveLength(14);
+    expect(CSV_COLUMN_ORDER).toHaveLength(14);
+  });
+
+  it("validates data rows match header column count", () => {
+    const csv = buildContributorsCsv([mockContributor]);
+    const lines = csv.split("\n").filter((line) => line.trim());
+
+    const headerColumnCount = lines[0].split(",").length;
+
+    // Check all data rows have same column count as header
+    for (let i = 1; i < lines.length; i++) {
+      const rowColumnCount = lines[i].split(",").length;
+      expect(rowColumnCount).toBe(headerColumnCount);
+    }
+  });
+
+  it("protects against accidental column insertion", () => {
+    // This test fails if a developer adds a new column without updating
+    // the golden test above, preventing silent finance script breakage
+    const csv = buildContributorsCsv([mockContributor]);
+    const lines = csv.split("\n");
+    const actualColumns = lines[0]
+      .split(",")
+      .map((col) => col.replace(/"/g, ""));
+
+    expect(actualColumns).toEqual(CSV_COLUMN_ORDER);
+  });
+
+  it("ensures no column header contains commas or newlines", () => {
+    // Commas or newlines in headers would break CSV parsers
+    CSV_COLUMN_ORDER.forEach((col) => {
+      expect(col).not.toContain(",");
+      expect(col).not.toContain("\n");
+      expect(col).not.toContain("\r");
+    });
   });
 });
